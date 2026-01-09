@@ -9,7 +9,7 @@
 #include <memory>
 #include <cctype>
 
-// ======= FAST HELPERS (senin üst koddakiyle aynı mantık) =======
+
 
 static inline int fastParseHour(const char* p, size_t len) noexcept {
     // Expected: "YYYY-MM-DD HH:MM"
@@ -29,7 +29,7 @@ static inline size_t findComma(const std::string& s, size_t start) noexcept {
     return s.find(',', start);
 }
 
-// ======= PIMPL-LIKE STORAGE (GitHub’da çalışan stil) =======
+
 
 class TripAnalyzerImpl {
 public:
@@ -64,7 +64,7 @@ static void cleanupIfNeeded() {
     if (implMap.size() > 200) implMap.clear();
 }
 
-// ======= REQUIRED METHODS (GitHub testlerinin çağırdığı) =======
+
 
 void TripAnalyzer::ingestFile(const std::string& csvPath) {
     cleanupIfNeeded();
@@ -118,7 +118,7 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
         if (dtLen == 0) continue;
 
         // Eğer datetime tırnaklı geliyorsa: "YYYY-MM-DD HH:MM"
-        // üst algoritmayı bozmadan sadece offset düzeltelim
+       
         const char* dtPtr = line.data() + dtStart;
         size_t dtRealLen = dtLen;
         if (dtRealLen >= 2 && dtPtr[0] == '"' && dtPtr[dtRealLen - 1] == '"') {
@@ -142,7 +142,7 @@ void TripAnalyzer::ingestFile(const std::string& csvPath) {
             impl->hourCounts.push_back({});
             impl->hourCounts.back().fill(0);
 
-            // key olarak zones.back() kullan (string lifetime garanti)
+            
             impl->zoneIndex.emplace(impl->zones.back(), idx);
         } else {
             idx = it->second;
@@ -210,3 +210,4 @@ std::vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
     std::sort(all.begin(), all.end(), cmp);
     return all;
 }
+
