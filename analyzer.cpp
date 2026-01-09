@@ -1,283 +1,153 @@
 #include "analyzer.h"
-#include "catch_amalgamated.hpp"
 
 #include <fstream>
-#include <string>
-#include <vector>
-#include <cstdio>   // std::remove
+#include <algorithm>
+#include <unordered_map>
+#include <array>
+#include <string_view>
+#include <cctype>
 
-// ------------------- helpers -------------------
-static void writeFile(const std::string& path, const std::vector<std::string>& lines) {
-    std::ofstream out(path);
-    REQUIRE(out.is_open());
-    for (const auto& ln : lines) out << ln << "\n";
+static inline int fastParseHour(const char* p, size_t len) noexcept {
+    // Expected format in field: "YYYY-MM-DD HH:MM"  (at least 16 chars)
+    // We only need HH at positions 11-12 (0-based) within that field.
+    if (len < 13) return -1;
+    if (p[10] != ' ') return -1;
+
+    unsigned char c1 = (unsigned char)p[11];
+    unsigned char c2 = (unsigned char)p[12];
+    if (!std::isdigit(c1) || !std::isdigit(c2)) return -1;
+
+    int h = (p[11] - '0') * 10 + (p[12] - '0');
+    return (h >= 0 && h <= 23) ? h : -1;
 }
 
-static bool hasZone(const std::vector<ZoneCount>& v, const std::string& zone, long long count) {
-    for (const auto& z : v) if (z.zone == zone && z.count == count) return true;
-    return false;
+static inline size_t findComma(const std::string& s, size_t start) noexcept {
+    return s.find(',', start);
 }
 
-static bool hasSlot(const std::vector<SlotCount>& v, const std::string& zone, int hour, long long count) {
-    for (const auto& s : v) if (s.zone == zone && s.hour == hour && s.count == count) return true;
-    return false;
-}
+void TripAnalyzer::ingestFile(const std::string& csvPath) {
+    zoneIndex.clear();
+    zones.clear();
+    zoneCounts.clear();
+    hourCounts.clear();
 
-static const char* HDR = "TripID,PickupZoneID,DropoffZoneID,PickupDateTime,DistanceKm,FareAmount";
+    std::ifstream file(csvPath);
+    if (!file.is_open()) return;
 
-// ------------------- A: ingestion robustness -------------------
+    std::string line;
+    // Skip header
+    if (!std::getline(file, line)) return;
 
-TEST_CASE("A1", "[A1]") {
-    TripAnalyzer ta;
-    ta.ingestFile("missing_file_hopefully_123.csv");
+    zoneIndex.reserve(4096);
+    zones.reserve(4096);
+    zoneCounts.reserve(4096);
+    hourCounts.reserve(4096);
 
-    REQUIRE(ta.topZones(10).empty());
-    REQUIRE(ta.topBusySlots(10).empty());
-}
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
 
-TEST_CASE("A2", "[A2]") {
-    const std::string path = "a2.csv";
+        // Need at least first 6 fields:
+        // TripID,PickupZoneID,DropoffZoneID,PickupDateTime,DistanceKm,FareAmount
+        size_t c0 = findComma(line, 0);
+        if (c0 == std::string::npos) continue;
+        size_t c1 = findComma(line, c0 + 1);
+        if (c1 == std::string::npos) continue;
+        size_t c2 = findComma(line, c1 + 1);
+        if (c2 == std::string::npos) continue;
+        size_t c3 = findComma(line, c2 + 1);
+        if (c3 == std::string::npos) continue;
+        size_t c4 = findComma(line, c3 + 1);
+        if (c4 == std::string::npos) continue;
 
-    // Mix of valid + malformed
-    writeFile(path, {
-        HDR,
-        // valid
-        "1,ZONE_A,ZONE_X,2024-01-01 09:15,1.2,10.0",
-        // malformed: missing PickupZoneID
-        "2,,ZONE_X,2024-01-01 09:15,1.2,10.0",
-        // malformed: missing PickupDateTime
-        "3,ZONE_A,ZONE_X,,1.2,10.0",
-        // malformed: too few columns
-        "4,ZONE_A,ZONE_X,2024-01-01 10:00",
-        // malformed: bad date string (hour can't be parsed)
-        "5,ZONE_B,ZONE_Y,NOT_A_DATE,2.0,12.5",
-        // valid
-        "6,ZONE_B,ZONE_Y,2024-01-01 23:59,2.0,12.5"
-    });
+        // PickupZoneID is field[1] => between c0 and c1
+        size_t zStart = c0 + 1;
+        size_t zLen = (c1 > zStart) ? (c1 - zStart) : 0;
+        if (zLen == 0) continue;
 
-    TripAnalyzer ta;
-    ta.ingestFile(path);
+        std::string_view zoneSv(line.data() + zStart, zLen);
 
-    auto topZ = ta.topZones(10);
-    auto topS = ta.topBusySlots(10);
+        // PickupDateTime is field[3] => between c2 and c3
+        size_t dtStart = c2 + 1;
+        size_t dtLen = (c3 > dtStart) ? (c3 - dtStart) : 0;
+        if (dtLen == 0) continue;
 
-    // Only rows 1 and 6 should count:
-    REQUIRE(hasZone(topZ, "ZONE_A", 1));
-    REQUIRE(hasZone(topZ, "ZONE_B", 1));
+        int hour = fastParseHour(line.data() + dtStart, dtLen);
+        if (hour < 0) continue;
 
-    REQUIRE(hasSlot(topS, "ZONE_A", 9, 1));
-    REQUIRE(hasSlot(topS, "ZONE_B", 23, 1));
+        // Keep the same logic: store zone as string key
+        std::string zoneKey(zoneSv);
 
-    std::remove(path.c_str());
-}
+        auto it = zoneIndex.find(zoneKey);
+        int idx;
+        if (it == zoneIndex.end()) {
+            idx = (int)zones.size();
+            zones.emplace_back(std::move(zoneKey));
+            zoneCounts.push_back(0);
 
-TEST_CASE("A3", "[A3]") {
-    const std::string path = "a3.csv";
+            hourCounts.push_back({});
+            hourCounts.back().fill(0);
 
-    writeFile(path, {
-        HDR,
-        "1,ZONE_A,ZX,2024-01-01 00:00,1,1",
-        "2,ZONE_A,ZX,2024-01-01 23:59,1,1",
-        "3,ZONE_A,ZX,2024-01-01 23:00,1,1"
-    });
+            // IMPORTANT: use zones.back() as key to avoid mismatch
+            zoneIndex.emplace(zones.back(), idx);
+        } else {
+            idx = it->second;
+        }
 
-    TripAnalyzer ta;
-    ta.ingestFile(path);
-
-    auto topS = ta.topBusySlots(10);
-    REQUIRE(hasSlot(topS, "ZONE_A", 0, 1));
-    REQUIRE(hasSlot(topS, "ZONE_A", 23, 2));
-
-    std::remove(path.c_str());
-}
-
-// ------------------- B: correctness + sorting -------------------
-
-TEST_CASE("B1", "[B1]") {
-    const std::string path = "b1.csv";
-
-    writeFile(path, {
-        HDR,
-        "1,ZONE_A,ZX,2024-01-01 10:00,1,1",
-        "2,ZONE_A,ZY,2024-01-01 11:00,1,1",
-        "3,ZONE_B,ZX,2024-01-01 10:30,1,1",
-        "4,ZONE_A,ZZ,2024-01-01 12:00,1,1",
-        "5,ZONE_C,ZX,2024-01-01 10:00,1,1"
-    });
-
-    TripAnalyzer ta;
-    ta.ingestFile(path);
-
-    auto topZ = ta.topZones(10);
-    REQUIRE(hasZone(topZ, "ZONE_A", 3));
-    REQUIRE(hasZone(topZ, "ZONE_B", 1));
-    REQUIRE(hasZone(topZ, "ZONE_C", 1));
-
-    std::remove(path.c_str());
-}
-
-TEST_CASE("B2", "[B2]") {
-    const std::string path = "b2.csv";
-
-    // Tie: ZONE_A=2, ZONE_B=2, ensure zone asc for ties.
-    writeFile(path, {
-        HDR,
-        "1,ZONE_B,ZX,2024-01-01 10:00,1,1",
-        "2,ZONE_A,ZX,2024-01-01 10:00,1,1",
-        "3,ZONE_B,ZX,2024-01-01 11:00,1,1",
-        "4,ZONE_A,ZX,2024-01-01 11:00,1,1",
-        "5,ZONE_C,ZX,2024-01-01 10:00,1,1"
-    });
-
-    TripAnalyzer ta;
-    ta.ingestFile(path);
-
-    auto topZ = ta.topZones(10);
-    REQUIRE(topZ.size() >= 3);
-
-    // top two must be (ZONE_A,2) then (ZONE_B,2)
-    REQUIRE(topZ[0].count == 2);
-    REQUIRE(topZ[1].count == 2);
-    REQUIRE(topZ[0].zone == "ZONE_A");
-    REQUIRE(topZ[1].zone == "ZONE_B");
-
-    std::remove(path.c_str());
-}
-
-TEST_CASE("B3", "[B3]") {
-    const std::string path = "b3.csv";
-
-    // Case sensitivity: ZONE01 != zone01
-    writeFile(path, {
-        HDR,
-        "1,ZONE01,ZX,2024-01-01 10:00,1,1",
-        "2,zone01,ZX,2024-01-01 10:00,1,1",
-        "3,ZONE01,ZX,2024-01-01 10:00,1,1"
-    });
-
-    TripAnalyzer ta;
-    ta.ingestFile(path);
-
-    auto topZ = ta.topZones(10);
-    REQUIRE(hasZone(topZ, "ZONE01", 2));
-    REQUIRE(hasZone(topZ, "zone01", 1));
-
-    std::remove(path.c_str());
-}
-
-// ------------------- C: scale / efficiency style tests -------------------
-// NOTE: avoid strict timing assertions (unstable across machines).
-// These tests validate correctness on large inputs.
-
-TEST_CASE("C1", "[C1]") {
-    const std::string path = "c1.csv";
-
-    std::ofstream out(path);
-    REQUIRE(out.is_open());
-    out << HDR << "\n";
-
-    long long id = 1;
-    // 60k ZONE_BIG @ hour 12
-    for (int i = 0; i < 60000; ++i, ++id)
-        out << id << ",ZONE_BIG,ZX,2024-01-01 12:00,1.0,5.0\n";
-    // 30k ZONE_MED @ hour 12
-    for (int i = 0; i < 30000; ++i, ++id)
-        out << id << ",ZONE_MED,ZX,2024-01-01 12:00,1.0,5.0\n";
-    // 10k ZONE_SMALL @ hour 12
-    for (int i = 0; i < 10000; ++i, ++id)
-        out << id << ",ZONE_SMALL,ZX,2024-01-01 12:00,1.0,5.0\n";
-    out.close();
-
-    TripAnalyzer ta;
-    ta.ingestFile(path);
-
-    auto topZ = ta.topZones(3);
-    REQUIRE(topZ.size() == 3);
-    REQUIRE(topZ[0].zone == "ZONE_BIG");
-    REQUIRE(topZ[0].count == 60000);
-    REQUIRE(topZ[1].zone == "ZONE_MED");
-    REQUIRE(topZ[1].count == 30000);
-    REQUIRE(topZ[2].zone == "ZONE_SMALL");
-    REQUIRE(topZ[2].count == 10000);
-
-    auto topS = ta.topBusySlots(1);
-    REQUIRE(topS.size() == 1);
-    REQUIRE(topS[0].zone == "ZONE_BIG");
-    REQUIRE(topS[0].hour == 12);
-    REQUIRE(topS[0].count == 60000);
-
-    std::remove(path.c_str());
-}
-
-TEST_CASE("C2", "[C2]") {
-    const std::string path = "c2.csv";
-
-    // Many unique zones, same hour -> tests map growth / hashing behavior
-    std::ofstream out(path);
-    REQUIRE(out.is_open());
-    out << HDR << "\n";
-
-    long long id = 1;
-    // 50k unique-ish zones each 1 trip @ 08
-    for (int i = 0; i < 50000; ++i, ++id) {
-        out << id << ",ZONE_" << i << ",ZX,2024-01-01 08:00,1.0,5.0\n";
+        zoneCounts[idx] += 1;
+        hourCounts[idx][hour] += 1;
     }
-    // Add some repeats to create a clear top
-    for (int i = 0; i < 20000; ++i, ++id) {
-        out << id << ",ZONE_TOP,ZX,2024-01-01 08:30,1.0,5.0\n";
-    }
-    out.close();
-
-    TripAnalyzer ta;
-    ta.ingestFile(path);
-
-    auto topZ = ta.topZones(1);
-    REQUIRE(topZ.size() == 1);
-    REQUIRE(topZ[0].zone == "ZONE_TOP");
-    REQUIRE(topZ[0].count == 20000);
-
-    auto topS = ta.topBusySlots(1);
-    REQUIRE(topS.size() == 1);
-    REQUIRE(topS[0].zone == "ZONE_TOP");
-    REQUIRE(topS[0].hour == 8);
-    REQUIRE(topS[0].count == 20000);
-
-    std::remove(path.c_str());
 }
 
-TEST_CASE("C3", "[C3]") {
-    const std::string path = "c3.csv";
+std::vector<ZoneCount> TripAnalyzer::topZones(int k) const {
+    std::vector<ZoneCount> result;
+    result.reserve(zones.size());
 
-    // Stress busy slots across all 24 hours for one zone, verify tie-breaking by hour
-    std::ofstream out(path);
-    REQUIRE(out.is_open());
-    out << HDR << "\n";
+    for (size_t i = 0; i < zones.size(); ++i) {
+        result.push_back({zones[i], zoneCounts[i]});
+    }
 
-    long long id = 1;
-    // For ZONE_TIE, each hour gets exactly 1000 trips.
-    // Then topBusySlots(5) should return hours 0,1,2,3,4 (hour asc tie-break).
-    for (int h = 0; h < 24; ++h) {
-        for (int i = 0; i < 1000; ++i, ++id) {
-            // keep HH:MM valid
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "2024-01-01 %02d:%02d", h, (i % 60));
-            out << id << ",ZONE_TIE,ZX," << buf << ",1.0,5.0\n";
+    auto cmp = [](const ZoneCount& a, const ZoneCount& b) {
+        if (a.count != b.count) return a.count > b.count;
+        return a.zone < b.zone;
+    };
+
+    if (k <= 0) return {};
+    if ((int)result.size() <= k) {
+        std::sort(result.begin(), result.end(), cmp);
+        return result;
+    }
+
+    std::nth_element(result.begin(), result.begin() + k, result.end(), cmp);
+    result.resize(k);
+    std::sort(result.begin(), result.end(), cmp);
+    return result;
+}
+
+std::vector<SlotCount> TripAnalyzer::topBusySlots(int k) const {
+    std::vector<SlotCount> all;
+    all.reserve(zones.size() * 4);
+
+    for (size_t i = 0; i < zones.size(); ++i) {
+        for (int h = 0; h < 24; ++h) {
+            long long c = hourCounts[i][h];
+            if (c) all.push_back({zones[i], h, c});
         }
     }
-    out.close();
 
-    TripAnalyzer ta;
-    ta.ingestFile(path);
+    auto cmp = [](const SlotCount& a, const SlotCount& b) {
+        if (a.count != b.count) return a.count > b.count;
+        if (a.zone != b.zone) return a.zone < b.zone;
+        return a.hour < b.hour;
+    };
 
-    auto topS = ta.topBusySlots(5);
-    REQUIRE(topS.size() == 5);
-
-    // All counts equal (1000), same zone => hour asc
-    for (int i = 0; i < 5; ++i) {
-        REQUIRE(topS[i].zone == "ZONE_TIE");
-        REQUIRE(topS[i].count == 1000);
-        REQUIRE(topS[i].hour == i);
+    if (k <= 0) return {};
+    if ((int)all.size() <= k) {
+        std::sort(all.begin(), all.end(), cmp);
+        return all;
     }
 
-    std::remove(path.c_str());
+    std::nth_element(all.begin(), all.begin() + k, all.end(), cmp);
+    all.resize(k);
+    std::sort(all.begin(), all.end(), cmp);
+    return all;
 }
